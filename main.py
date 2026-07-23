@@ -59,15 +59,9 @@ SIDO_GEOJSON_URL = (
 # 0-1. 후보자 -> 정당 -> 색상 매핑
 #      (제21대 대통령선거 실제 후보 기준. 여기 없는 이름은 자동으로 "기타/무소속" 회색 처리)
 # ------------------------------------------------------------
-CANDIDATE_PARTY = {
-    "이재명": "더불어민주당",
-    "김문수": "국민의힘",
-    "이준석": "개혁신당",
-    "권영국": "민주노동당",
-    "황교안": "무소속",
-    "송진호": "무소속",
-    "구주와": "무소속",
-}
+# 실제 CSV의 '후보자' 값은 "더불어민주당 이재명"처럼 정당명이 이름 앞에 붙어 있음.
+# 그래서 이름이 아니라 '정당명 접두어'로 매칭한다.
+KNOWN_PARTIES = ["더불어민주당", "국민의힘", "개혁신당", "민주노동당", "무소속"]
 
 PARTY_COLOR = {
     "더불어민주당": "#0050A2",
@@ -80,8 +74,14 @@ PARTY_COLOR = {
 
 
 def get_party(candidate_name: str) -> str:
-    """후보자 이름으로 정당을 찾는다. 모르는 이름이면 '기타/무소속'으로 처리."""
-    return CANDIDATE_PARTY.get(candidate_name, "기타/무소속")
+    """'더불어민주당 이재명'처럼 정당명이 앞에 붙은 후보자 문자열에서 정당명을 추출한다.
+    매칭되는 정당이 없으면 '기타/무소속'으로 처리."""
+    if not isinstance(candidate_name, str):
+        return "기타/무소속"
+    for party in KNOWN_PARTIES:
+        if candidate_name.startswith(party):
+            return party
+    return "기타/무소속"
 
 
 def get_party_color(party_name: str) -> str:
@@ -167,10 +167,15 @@ def fetch_sido_geojson():
         return None, f"🗺️ 지도 경계 데이터를 불러오지 못했어요. 지도 대신 막대그래프로 보여드릴게요. ({e})"
 
 
-# 원본 CSV에 있을 수 있는 "후보자 득표수가 아닌" 컬럼들 (이 목록에 없는 컬럼은 전부 후보자 이름으로 취급)
+# 세로형(long) CSV의 '후보자' 컬럼에는 실제 후보자 이름 외에
+# "선거인수", "투표수", "무효 투표수", "기권자수" 같은 통계 행도 함께 섞여 있을 수 있다.
+# 이 값들은 후보자가 아니므로 득표 집계에서 반드시 제외해야 한다.
+NON_CANDIDATE_VALUES = {"선거인수", "투표수", "무효 투표수", "기권자수", "계"}
+
+# 원본 CSV에 있을 수 있는 "후보자 득표수가 아닌" 컬럼들 (가로형일 때, 이 목록에 없는 컬럼은 후보자 이름으로 취급)
 NON_CANDIDATE_COLUMNS = {
     COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG, "투표구명",
-    "선거인수", "투표수", "무효투표수", "기권수", "계",
+    "선거인수", "투표수", "무효투표수", "무효 투표수", "기권수", "기권자수", "계",
 }
 
 
@@ -203,8 +208,9 @@ def parse_election_csv(raw_bytes: bytes) -> tuple:
             "중앙선거관리위원회 개표결과 원본 CSV가 맞는지 확인해주세요."
         )
 
-    # 이미 후보자/득표수 컬럼이 있는 세로형이면 그대로 사용
+    # 이미 후보자/득표수 컬럼이 있는 세로형이면, 후보자가 아닌 통계 행(선거인수/투표수/무효표/기권수)을 제거하고 사용
     if COL_CANDIDATE in df.columns and COL_VOTES in df.columns:
+        df = df[~df[COL_CANDIDATE].isin(NON_CANDIDATE_VALUES)].copy()
         return df, None
 
     # 가로형(후보자 이름이 열)이면 -> 세로형으로 녹여서(melt) 통일
@@ -326,6 +332,10 @@ def aggregate_votes(df: pd.DataFrame, level: str) -> pd.DataFrame:
 
     candidate_cols = wide_table.columns.tolist()
     wide_table["총 득표수"] = wide_table[candidate_cols].sum(axis=1)
+
+    # "잘못 투입·구분된 투표지"처럼 모든 후보 득표수가 0인 행은 실제 지역이 아니므로 제거
+    wide_table = wide_table[wide_table["총 득표수"] > 0]
+
     wide_table["1위 후보"] = wide_table[candidate_cols].idxmax(axis=1)
     wide_table["1위 득표율(%)"] = (
         wide_table[candidate_cols].max(axis=1) / wide_table["총 득표수"] * 100
@@ -456,13 +466,20 @@ with tab2:
         st.info("지도는 현재 '시도' 단위에서만 지원돼요. 사이드바에서 지역 분석 단위를 '시도'로 바꿔보세요.")
     geojson, geo_error = fetch_sido_geojson()
     if level == "시도" and geojson is not None:
+        # 지도 GeoJSON은 2013년 행정구역명을 쓰고 있어, 2023년에 개편된 시도명을
+        # 지도 매칭 전용으로 옛 이름으로 바꿔준다 (화면에 보여주는 이름 자체는 그대로 둠).
+        OLD_SIDO_NAME = {"강원특별자치도": "강원도", "전북특별자치도": "전라북도"}
+        map_table = region_table.copy()
+        map_table["region_geo"] = map_table["region"].replace(OLD_SIDO_NAME)
+
         map_fig = px.choropleth(
-            region_table,
+            map_table,
             geojson=geojson,
             featureidkey="properties.name",
-            locations="region",
+            locations="region_geo",
             color="1위 정당",
             color_discrete_map=PARTY_COLOR,
+            hover_name="region",
             hover_data=["1위 후보", "1위 득표율(%)", "총 득표수"],
         )
         map_fig.update_geos(fitbounds="locations", visible=False)
