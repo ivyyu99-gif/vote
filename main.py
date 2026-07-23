@@ -75,6 +75,84 @@ def get_party_color(party_name: str) -> str:
     return PARTY_COLOR.get(party_name, "#9AA0A6")
 
 
+# ------------------------------------------------------------
+# 0-2. 투표율 데이터
+# ------------------------------------------------------------
+# 제21대 대통령선거(2025-06-03) 시도별 최종 투표율.
+# 이 오픈API/CSV에는 투표율 정보가 없어서, 공개된 공식 개표 결과(중앙선거관리위원회 발표 기준)를
+# 직접 찾아 하드코딩해뒀습니다. 시도 단위를 선택했을 때만 사용됩니다.
+TURNOUT_BY_SIDO = {
+    "서울특별시": 80.1, "인천광역시": 77.7, "경기도": 79.4,
+    "부산광역시": 78.4, "울산광역시": 80.1, "경상남도": 78.5,
+    "대구광역시": 80.2, "경상북도": 78.9,
+    "광주광역시": 83.9, "전북특별자치도": 82.5, "전라남도": 83.6,
+    "대전광역시": 78.7, "세종특별자치시": 82.9, "충청북도": 77.3, "충청남도": 76.0,
+    "강원특별자치도": 77.6, "제주특별자치도": 74.6,
+}
+
+# 시군구 단위 투표율은 이 오픈API/CSV에 없고, 별도의 선관위 "투·개표 정보" 오픈API로만 조회할 수 있습니다.
+# (이 API는 여기까지 쓴 개표결과 API와는 완전히 다른 서비스라, 별도로 활용신청해서 받은
+#  서비스키가 필요합니다. secrets.toml에 NEC_TURNOUT_SERVICE_KEY로 등록하면 자동으로 켜집니다.)
+NEC_TURNOUT_URL = "http://apis.data.go.kr/9760000/VoteXmntckInfoInqireService2/getVoteSttusInfoInqire"
+NEC_TURNOUT_KEY = st.secrets.get("NEC_TURNOUT_SERVICE_KEY", "")
+# 선거ID(sgId)는 보통 선거일(YYYYMMDD), 선거종류코드(sgTypecode)는 대통령선거가 1번입니다.
+# 혹시 안 맞으면 secrets.toml에 NEC_SG_ID / NEC_SG_TYPECODE로 직접 지정할 수 있게 해뒀습니다.
+NEC_SG_ID = st.secrets.get("NEC_SG_ID", "20250603")
+NEC_SG_TYPECODE = st.secrets.get("NEC_SG_TYPECODE", "1")
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def fetch_turnout_from_nec(sido: str, sigungu: str):
+    """
+    선관위 '투·개표 정보' 오픈API에서 특정 시군구의 투표율을 조회한다.
+    (전국 250여 개 시군구를 매번 다 부르면 느리므로, 경합 지역으로 추려진 곳만 조회한다)
+
+    반환값: (성공 시 투표율(float), 실패 시 None), (실패 안내 메시지, 성공하면 None)
+    """
+    if not NEC_TURNOUT_KEY:
+        return None, None  # 키가 없으면 조용히 건너뜀 (경합 지역 탭에서 안내 문구로 대신 표시)
+
+    try:
+        resp = requests.get(
+            NEC_TURNOUT_URL,
+            params={
+                "ServiceKey": NEC_TURNOUT_KEY,
+                "sgId": NEC_SG_ID,
+                "sgTypecode": NEC_SG_TYPECODE,
+                "sdName": sido,
+                "wiwName": sigungu,
+                "numOfRows": 10,
+                "type": "json",
+            },
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return None, "투표율 서버에 연결하지 못했어요."
+
+    if resp.status_code != 200:
+        return None, f"투표율 서버 오류 (HTTP {resp.status_code})"
+
+    # 이 API는 기본적으로 XML을 주기도 해서, JSON 파싱이 안 되면 XML로도 시도해본다.
+    try:
+        body = resp.json()
+        items = body.get("response", {}).get("body", {}).get("items", {}).get("item", [])
+        if isinstance(items, dict):
+            items = [items]
+        if not items:
+            return None, "해당 지역의 투표율 데이터를 찾지 못했어요."
+        return float(items[0].get("Turnout")), None
+    except (ValueError, AttributeError, TypeError):
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp.content)
+            turnout_el = root.find(".//Turnout")
+            if turnout_el is not None and turnout_el.text:
+                return float(turnout_el.text), None
+        except Exception:
+            pass
+        return None, "투표율 응답을 이해하지 못했어요 (형식 오류)."
+
+
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def fetch_sido_geojson():
     """
@@ -454,20 +532,74 @@ with tab5:
     if close_races.empty:
         st.info("선택한 기준보다 격차가 작은 지역이 없어요. 슬라이더 값을 올려보세요.")
     else:
-        close_fig = px.bar(
-            close_races,
-            x="region",
-            y="격차(%p)",
-            color="1위 정당",
-            color_discrete_map=PARTY_COLOR,
-            hover_data=["1위 후보", "2위 후보", "1위 득표율(%)", "2위 득표율(%)", "총 득표수"],
+        # 격차(%p) 하나만 보여주는 대신, 1위·2위 후보의 실제 득표율을 나란히 그려서
+        # "누가 얼마나 앞섰는지"가 한눈에 보이도록 함
+        rank1 = close_races[["region", "1위 후보", "1위 득표율(%)"]].rename(
+            columns={"1위 후보": "후보", "1위 득표율(%)": "득표율(%)"}
         )
-        close_fig.update_layout(xaxis_title="", xaxis={"categoryorder": "total ascending"})
+        rank1["순위"] = "1위"
+        rank2 = close_races[["region", "2위 후보", "2위 득표율(%)"]].rename(
+            columns={"2위 후보": "후보", "2위 득표율(%)": "득표율(%)"}
+        )
+        rank2["순위"] = "2위"
+        rank_long = pd.concat([rank1, rank2], ignore_index=True)
+        rank_long["정당"] = rank_long["후보"].map(get_party)
+
+        close_fig = px.bar(
+            rank_long,
+            x="region",
+            y="득표율(%)",
+            color="정당",
+            color_discrete_map=PARTY_COLOR,
+            barmode="group",
+            hover_data=["후보", "순위"],
+        )
+        close_fig.update_layout(
+            xaxis_title="", xaxis={"categoryorder": "array", "categoryarray": close_races["region"].tolist()}
+        )
         st.plotly_chart(close_fig, use_container_width=True)
+
+        # --- 투표율 ---
+        st.subheader("경합 지역 투표율")
+        if level == "시도":
+            close_races = close_races.copy()
+            close_races["투표율(%)"] = close_races["region"].map(TURNOUT_BY_SIDO)
+            st.caption("시도별 최종 투표율(선관위 발표 기준, 직접 확인해 반영한 수치)입니다.")
+            turnout_fig = px.bar(
+                close_races.dropna(subset=["투표율(%)"]),
+                x="region", y="투표율(%)", color="1위 정당", color_discrete_map=PARTY_COLOR,
+            )
+            st.plotly_chart(turnout_fig, use_container_width=True)
+        elif NEC_TURNOUT_KEY:
+            st.caption("선관위 '투·개표 정보' 오픈API로 시군구별 투표율을 실시간 조회합니다.")
+            turnout_rows = []
+            for _, r in close_races.iterrows():
+                parts = r["region"].split(" ", 1)
+                sido_name = parts[0]
+                sigungu_name = parts[1] if len(parts) > 1 else ""
+                turnout, err = fetch_turnout_from_nec(sido_name, sigungu_name)
+                turnout_rows.append(turnout)
+            close_races = close_races.copy()
+            close_races["투표율(%)"] = turnout_rows
+            if close_races["투표율(%)"].notna().any():
+                turnout_fig = px.bar(
+                    close_races.dropna(subset=["투표율(%)"]),
+                    x="region", y="투표율(%)", color="1위 정당", color_discrete_map=PARTY_COLOR,
+                )
+                st.plotly_chart(turnout_fig, use_container_width=True)
+            else:
+                st.warning("투표율을 하나도 받아오지 못했어요. sgId/sgTypecode 값이 맞는지 확인해주세요.")
+        else:
+            st.info(
+                "시군구·읍면동 단위 투표율은 이 CSV에 없고, 별도의 선관위 '투·개표 정보' 오픈API가 필요해요. "
+                "data.go.kr에서 '중앙선거관리위원회_투·개표 정보'를 활용신청한 뒤, "
+                "서비스키를 secrets.toml에 NEC_TURNOUT_SERVICE_KEY로 등록하면 여기에 자동으로 표시됩니다."
+            )
 
         st.dataframe(
             close_races[
                 ["region", "1위 후보", "1위 득표율(%)", "2위 후보", "2위 득표율(%)", "격차(%p)", "총 득표수"]
+                + (["투표율(%)"] if "투표율(%)" in close_races.columns else [])
             ],
             use_container_width=True,
         )
@@ -483,6 +615,8 @@ with tab5:
 st.divider()
 st.caption(
     "⚠️ 이 데이터에는 선거인수·투표수·무효표 컬럼이 없어 투표율은 계산할 수 없습니다. "
+    "시도 단위 투표율은 선관위 발표 수치를 직접 반영했고, 시군구 단위 투표율은 "
+    "별도 오픈API 서비스키(NEC_TURNOUT_SERVICE_KEY)가 있을 때만 표시됩니다. "
     "지도는 공개 행정구역 경계 데이터를 사용하며, 여기 없는 후보 이름은 '기타/무소속'(회색)으로 표시됩니다. "
     "GitHub 주소가 비어있거나 오류가 나면 데모(가상) 데이터로 자동 대체됩니다."
 )
