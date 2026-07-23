@@ -9,7 +9,11 @@
 #     이 폴더를 그대로 Streamlit Cloud에 올리고, 실행 파일로 main.py를 지정하면 됩니다.
 #
 # ▶ 이 앱이 하는 일
-#     1) 공공데이터포털 오픈API로 선거 개표결과를 실시간으로 받아옵니다.
+#     1) 데이터를 준비하는 방법은 4가지 중에서 고를 수 있습니다.
+#        - GitHub CSV 자동 연동(추천): GitHub에 올려둔 CSV의 raw 주소만 넣으면 매번 자동으로 받아옴
+#        - CSV 파일 업로드: data.go.kr에서 직접 받은 원본 CSV를 그때그때 올림
+#        - 오픈API 실시간 연동: 공공데이터포털 오픈API 호출 (응답이 느리거나 실패할 수 있음)
+#        - 데모 데이터: 아무것도 준비 안 됐을 때 화면 구조를 미리 보여주는 가상 데이터
 #     2) 시도 / 시군구 / 읍면동 중 원하는 단위로 득표수를 합산합니다.
 #     3) 주요 정당의 후보를 정당 고유 색으로 표시해서, 지도(시도 단위)와
 #        막대그래프로 지역별 분포를 한눈에 보여줍니다.
@@ -163,6 +167,92 @@ def fetch_sido_geojson():
         return None, f"🗺️ 지도 경계 데이터를 불러오지 못했어요. 지도 대신 막대그래프로 보여드릴게요. ({e})"
 
 
+# 원본 CSV에 있을 수 있는 "후보자 득표수가 아닌" 컬럼들 (이 목록에 없는 컬럼은 전부 후보자 이름으로 취급)
+NON_CANDIDATE_COLUMNS = {
+    COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG, "투표구명",
+    "선거인수", "투표수", "무효투표수", "기권수", "계",
+}
+
+
+def parse_election_csv(raw_bytes: bytes) -> tuple:
+    """
+    CSV 파일의 원본 바이트(byte)를 받아서, 후보자/득표수가 있는
+    "세로형(long)" 표로 통일해서 돌려준다. (파일 업로드/URL 다운로드 둘 다 이 함수를 씀)
+
+    data.go.kr에서 받는 원본 CSV는 보통 후보자 이름이 각각의 열로 나뉜
+    "가로형(wide)" 표라서, 이 함수가 자동으로 세로형으로 바꿔준다.
+    (이미 세로형이면 그대로 사용)
+
+    반환값: (성공 시 DataFrame, 실패 시 None), (실패했을 때 보여줄 안내 메시지, 성공하면 None)
+    """
+    # 한국 공공데이터 CSV는 UTF-8 또는 EUC-KR(CP949)로 저장된 경우가 많아, 둘 다 시도해본다.
+    df = None
+    for encoding in ("utf-8-sig", "cp949"):
+        try:
+            df = pd.read_csv(pd.io.common.BytesIO(raw_bytes), encoding=encoding)
+            break
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+
+    if df is None:
+        return None, "📄 CSV 파일을 읽을 수 없었어요. 파일 인코딩(UTF-8/EUC-KR)을 확인해주세요."
+
+    if COL_SIDO not in df.columns:
+        return None, (
+            f"📄 CSV에서 '{COL_SIDO}' 컬럼을 찾지 못했어요. "
+            "중앙선거관리위원회 개표결과 원본 CSV가 맞는지 확인해주세요."
+        )
+
+    # 이미 후보자/득표수 컬럼이 있는 세로형이면 그대로 사용
+    if COL_CANDIDATE in df.columns and COL_VOTES in df.columns:
+        return df, None
+
+    # 가로형(후보자 이름이 열)이면 -> 세로형으로 녹여서(melt) 통일
+    candidate_columns = [c for c in df.columns if c not in NON_CANDIDATE_COLUMNS]
+    if not candidate_columns:
+        return None, "📄 CSV에서 후보자 득표수 컬럼을 찾지 못했어요. 컬럼 이름을 확인해주세요."
+
+    id_columns = [c for c in [COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG] if c in df.columns]
+    long_df = df.melt(
+        id_vars=id_columns, value_vars=candidate_columns,
+        var_name=COL_CANDIDATE, value_name=COL_VOTES,
+    )
+    return long_df, None
+
+
+def load_csv_file(uploaded_file) -> tuple:
+    """사용자가 화면에서 직접 올린 CSV 파일을 읽어온다."""
+    return parse_election_csv(uploaded_file.read())
+
+
+@st.cache_data(ttl=60 * 60, show_spinner="GitHub에 올려둔 CSV를 불러오는 중입니다...")
+def fetch_csv_from_github(url: str) -> tuple:
+    """
+    GitHub 등에 올려둔 CSV 파일의 '원본(raw)' 주소를 받아서 자동으로 내려받는다.
+    예: https://raw.githubusercontent.com/사용자이름/저장소이름/main/election.csv
+
+    반환값: (성공 시 DataFrame, 실패 시 None), (실패했을 때 보여줄 안내 메시지, 성공하면 None)
+    """
+    if not url:
+        return None, "🔗 GitHub raw CSV 주소가 비어 있어요. 사이드바에 주소를 입력해주세요."
+
+    try:
+        resp = requests.get(url, timeout=15)
+    except requests.exceptions.Timeout:
+        return None, "⏱️ GitHub에서 CSV를 받아오는 데 시간이 너무 오래 걸려서 중단했어요. 잠시 후 다시 시도해주세요."
+    except requests.exceptions.ConnectionError:
+        return None, "🔌 GitHub 주소에 연결할 수 없었어요. 인터넷 연결과 주소를 확인해주세요."
+    except requests.exceptions.RequestException as e:
+        return None, f"⚠️ CSV를 받아오는 중 알 수 없는 오류가 발생했어요. ({e})"
+
+    if resp.status_code == 404:
+        return None, "🔍 해당 주소에서 파일을 찾을 수 없어요(404). GitHub raw 주소가 정확한지 확인해주세요."
+    if resp.status_code != 200:
+        return None, f"⚠️ GitHub에서 오류를 반환했어요. (HTTP 상태코드: {resp.status_code})"
+
+    return parse_election_csv(resp.content)
+
+
 # ------------------------------------------------------------
 # 2. 화면 테스트용 가짜(데모) 데이터
 #    - 실제 후보 이름을 사용해서, API 연동 전에도 정당 색상 표시를 확인할 수 있게 함
@@ -260,12 +350,30 @@ def national_candidate_totals(df: pd.DataFrame) -> pd.DataFrame:
 # 4. 사이드바
 # ------------------------------------------------------------
 st.sidebar.header("설정")
-use_api = st.sidebar.toggle(
-    "오픈API 실시간 연동",
-    value=False,
-    help="secrets.toml에 DATA_GO_KR_SERVICE_KEY를 등록해야 동작합니다. 꺼두면 데모 데이터를 보여줍니다.",
+data_source = st.sidebar.radio(
+    "데이터 소스",
+    ["GitHub CSV 자동 연동", "CSV 파일 업로드", "오픈API 실시간 연동", "데모 데이터"],
+    index=0,
+    help="GitHub에 CSV를 올려두면 매번 파일을 다시 올릴 필요 없이 자동으로 최신 파일을 받아와요.",
 )
 level = st.sidebar.radio("지역 분석 단위", ["시도", "시군구", "읍면동"], index=1)
+
+if data_source == "GitHub CSV 자동 연동":
+    st.sidebar.caption(
+        "GitHub 저장소에 CSV를 올린 뒤, 그 파일의 'Raw' 버튼을 눌러 나오는 주소를 붙여넣으세요.\n"
+        "예: https://raw.githubusercontent.com/사용자이름/저장소이름/main/election.csv"
+    )
+    github_csv_url = st.sidebar.text_input(
+        "GitHub raw CSV 주소",
+        value=st.secrets.get("GITHUB_CSV_URL", ""),
+    )
+
+elif data_source == "CSV 파일 업로드":
+    st.sidebar.markdown(
+        "[중앙선거관리위원회_대통령선거 개표결과_20250603 다운로드 페이지]"
+        "(https://www.data.go.kr/data/15025528/fileData.do)"
+    )
+    uploaded_file = st.sidebar.file_uploader("개표결과 CSV 파일 업로드", type=["csv"])
 
 with st.sidebar.expander("정당 색상 안내"):
     for party, color in PARTY_COLOR.items():
@@ -279,7 +387,25 @@ with st.sidebar.expander("정당 색상 안내"):
 
 # --- 원자료 준비 ---
 raw_df = None
-if use_api:
+
+if data_source == "GitHub CSV 자동 연동":
+    raw_df, error_message = fetch_csv_from_github(github_csv_url)
+    if error_message:
+        st.error(error_message)
+        st.info("대신 데모(가상) 데이터를 보여드릴게요.")
+        raw_df = None
+
+elif data_source == "CSV 파일 업로드":
+    if uploaded_file is not None:
+        raw_df, error_message = load_csv_file(uploaded_file)
+        if error_message:
+            st.error(error_message)
+            st.info("대신 데모(가상) 데이터를 보여드릴게요.")
+            raw_df = None
+    else:
+        st.info("왼쪽에서 CSV 파일을 올려주세요. 올리기 전까지는 데모(가상) 데이터를 보여드릴게요.")
+
+elif data_source == "오픈API 실시간 연동":
     raw_df, error_message = fetch_election_raw()
     if error_message:
         st.error(error_message)
