@@ -294,6 +294,7 @@ def aggregate_votes(df: pd.DataFrame, level: str) -> pd.DataFrame:
 
     wide_table["격차(%p)"] = (wide_table["1위 득표율(%)"] - wide_table["2위 득표율(%)"]).round(2)
     wide_table["투표율(%)"] = wide_table.index.map(turnout_by_region)
+    wide_table["선거인수"] = wide_table.index.map(sunsu_by_region)
 
     return wide_table.reset_index()
 
@@ -349,7 +350,7 @@ candidate_cols = [
     c for c in region_table.columns
     if c not in (
         "region", "총 득표수", "1위 후보", "1위 정당", "1위 득표율(%)", "정당색",
-        "2위 후보", "2위 득표율(%)", "격차(%p)",
+        "2위 후보", "2위 득표율(%)", "격차(%p)", "투표율(%)", "선거인수",
     )
 ]
 
@@ -506,25 +507,26 @@ with tab5:
         # --- 투표율 x 정당별 득표 비율 ---
         st.subheader("경합 지역 투표율 & 정당별 득표 비율")
         st.caption(
-            "막대 전체 높이가 100%이고, 그 안을 정당별 득표 비율로 나눠 색칠했습니다. "
-            "막대 위 숫자는 그 지역의 투표율입니다."
+            "막대 전체 높이가 그 지역의 투표율이고, 그 안을 정당별 득표 비율(선거인수 대비)로 나눠 색칠했습니다."
         )
-        turnout_data = close_races.dropna(subset=["투표율(%)"])
+        turnout_data = close_races.dropna(subset=["투표율(%)", "선거인수"])
         if turnout_data.empty:
             st.info("이 지역들의 투표율 데이터를 찾지 못했어요.")
         else:
             region_order = turnout_data["region"].tolist()
 
-            # 후보자별 득표수(여러 열)를 정당 단위로 합쳐서, 지역별 "정당 득표 비율(%)" 표를 만든다
+            # 후보자별 득표수(여러 열)를 정당 단위로 합쳐서, "선거인수 대비 정당 득표 비율(%)"을 만든다.
+            # (총 득표수가 아니라 선거인수로 나누기 때문에, 한 지역의 막대를 다 쌓으면
+            #  그 지역의 실제 투표율과 같아진다 - 무효표만큼만 살짝 낮게)
             cand_long = turnout_data[["region"] + candidate_cols].melt(
                 id_vars="region", var_name=COL_CANDIDATE, value_name="득표수"
             )
             cand_long["정당"] = cand_long[COL_CANDIDATE].map(get_party)
             party_share = cand_long.groupby(["region", "정당"], as_index=False)["득표수"].sum()
 
-            region_total_votes = turnout_data.set_index("region")["총 득표수"]
+            region_electorate = turnout_data.set_index("region")["선거인수"]
             party_share["득표율(%)"] = (
-                party_share["득표수"] / party_share["region"].map(region_total_votes) * 100
+                party_share["득표수"] / party_share["region"].map(region_electorate) * 100
             ).round(1)
 
             share_fig = px.bar(
@@ -537,16 +539,17 @@ with tab5:
                 text="득표율(%)",
             )
             share_fig.update_traces(texttemplate="%{text}%", textposition="inside")
+            max_turnout = float(turnout_data["투표율(%)"].max())
             share_fig.update_layout(
                 xaxis_title="",
-                yaxis_title="정당별 득표 비율(%)",
+                yaxis_title="선거인수 대비 정당별 득표 비율(%) = 투표율",
                 xaxis={"categoryorder": "array", "categoryarray": region_order},
-                yaxis_range=[0, 115],  # 위쪽에 투표율 숫자를 적을 여유 공간
+                yaxis_range=[0, max_turnout + 8],  # 위쪽에 투표율 숫자를 적을 여유 공간
             )
-            # 막대(100%) 맨 위에 그 지역의 투표율을 숫자로 표시
+            # 막대(그 지역 투표율만큼 쌓인 높이) 맨 위에 투표율 숫자를 표시
             for _, row in turnout_data.iterrows():
                 share_fig.add_annotation(
-                    x=row["region"], y=101, text=f"투표율 {row['투표율(%)']:.1f}%",
+                    x=row["region"], y=row["투표율(%)"], text=f"투표율 {row['투표율(%)']:.1f}%",
                     showarrow=False, yanchor="bottom", font=dict(size=11),
                 )
             st.plotly_chart(share_fig, use_container_width=True)
