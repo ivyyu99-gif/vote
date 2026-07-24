@@ -503,22 +503,53 @@ with tab5:
         )
         st.plotly_chart(close_fig, use_container_width=True)
 
-        # --- 투표율 ---
-        st.subheader("경합 지역 투표율")
-        st.caption("이 CSV에 '선거인수'/'투표수'로 들어있는 값을 지역 단위로 합산해 직접 계산했습니다.")
+        # --- 투표율 x 정당별 득표 비율 ---
+        st.subheader("경합 지역 투표율 & 정당별 득표 비율")
+        st.caption(
+            "막대 전체 높이가 100%이고, 그 안을 정당별 득표 비율로 나눠 색칠했습니다. "
+            "막대 위 숫자는 그 지역의 투표율입니다."
+        )
         turnout_data = close_races.dropna(subset=["투표율(%)"])
         if turnout_data.empty:
             st.info("이 지역들의 투표율 데이터를 찾지 못했어요.")
         else:
-            turnout_fig = px.bar(
-                turnout_data,
-                x="region", y="투표율(%)", color="1위 정당", color_discrete_map=PARTY_COLOR,
-                hover_data=["1위 후보", "1위 득표율(%)"],
+            region_order = turnout_data["region"].tolist()
+
+            # 후보자별 득표수(여러 열)를 정당 단위로 합쳐서, 지역별 "정당 득표 비율(%)" 표를 만든다
+            cand_long = turnout_data[["region"] + candidate_cols].melt(
+                id_vars="region", var_name=COL_CANDIDATE, value_name="득표수"
             )
-            turnout_fig.update_layout(
-                xaxis_title="", xaxis={"categoryorder": "array", "categoryarray": close_races["region"].tolist()}
+            cand_long["정당"] = cand_long[COL_CANDIDATE].map(get_party)
+            party_share = cand_long.groupby(["region", "정당"], as_index=False)["득표수"].sum()
+
+            region_total_votes = turnout_data.set_index("region")["총 득표수"]
+            party_share["득표율(%)"] = (
+                party_share["득표수"] / party_share["region"].map(region_total_votes) * 100
+            ).round(1)
+
+            share_fig = px.bar(
+                party_share,
+                x="region",
+                y="득표율(%)",
+                color="정당",
+                color_discrete_map=PARTY_COLOR,
+                barmode="stack",
+                text="득표율(%)",
             )
-            st.plotly_chart(turnout_fig, use_container_width=True)
+            share_fig.update_traces(texttemplate="%{text}%", textposition="inside")
+            share_fig.update_layout(
+                xaxis_title="",
+                yaxis_title="정당별 득표 비율(%)",
+                xaxis={"categoryorder": "array", "categoryarray": region_order},
+                yaxis_range=[0, 115],  # 위쪽에 투표율 숫자를 적을 여유 공간
+            )
+            # 막대(100%) 맨 위에 그 지역의 투표율을 숫자로 표시
+            for _, row in turnout_data.iterrows():
+                share_fig.add_annotation(
+                    x=row["region"], y=101, text=f"투표율 {row['투표율(%)']:.1f}%",
+                    showarrow=False, yanchor="bottom", font=dict(size=11),
+                )
+            st.plotly_chart(share_fig, use_container_width=True)
 
         st.dataframe(
             close_races[
