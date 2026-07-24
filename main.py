@@ -155,7 +155,7 @@ def fetch_csv_from_github(url: str) -> tuple:
     반환값: (성공 시 DataFrame, 실패 시 None), (실패했을 때 보여줄 안내 메시지, 성공하면 None)
     """
     if not url:
-        return None, "🔗 GitHub raw CSV 주소가 비어 있어요. 사이드바에 주소를 입력해주세요."
+        return None, "🔗 GitHub raw CSV 주소가 설정되지 않았어요. secrets.toml에 GITHUB_CSV_URL을 등록해주세요."
 
     try:
         resp = requests.get(url, timeout=15)
@@ -313,14 +313,9 @@ def national_candidate_totals(df: pd.DataFrame) -> pd.DataFrame:
 # 4. 사이드바 (데이터 소스는 GitHub CSV 자동 연동 하나만 사용)
 # ------------------------------------------------------------
 st.sidebar.header("설정")
-st.sidebar.caption(
-    "GitHub 저장소에 CSV를 올린 뒤, 그 파일의 'Raw' 버튼을 눌러 나오는 주소를 붙여넣으세요.\n"
-    "예: https://raw.githubusercontent.com/사용자이름/저장소이름/main/election.csv"
-)
-github_csv_url = st.sidebar.text_input(
-    "GitHub raw CSV 주소",
-    value=st.secrets.get("GITHUB_CSV_URL", ""),
-)
+# GitHub raw CSV 주소는 secrets.toml(GITHUB_CSV_URL)에 저장해둔 값을 그대로 사용합니다.
+# (이미 정해진 저장소에서만 불러오면 되므로, 화면에는 주소 입력창을 보여주지 않습니다)
+github_csv_url = st.secrets.get("GITHUB_CSV_URL", "")
 level = st.sidebar.radio("지역 분석 단위", ["시도", "시군구", "읍면동"], index=1)
 
 with st.sidebar.expander("정당 색상 안내"):
@@ -425,6 +420,52 @@ with tab2:
     st.plotly_chart(bar_fig, use_container_width=True)
 
 with tab3:
+    st.subheader("두 지역 득표율 비교")
+    region_options_all = region_table["region"].sort_values().tolist()
+    col_a, col_b = st.columns(2)
+    default_b_index = 1 if len(region_options_all) > 1 else 0
+    region_a = col_a.selectbox("지역 A", region_options_all, index=0, key="compare_region_a")
+    region_b = col_b.selectbox("지역 B", region_options_all, index=default_b_index, key="compare_region_b")
+
+    row_a = region_table[region_table["region"] == region_a].iloc[0]
+    row_b = region_table[region_table["region"] == region_b].iloc[0]
+
+    def _candidate_shares(row: pd.Series, region_name: str) -> pd.DataFrame:
+        """한 지역의 후보자별 득표율(%) 표를 만든다 (총 득표수 대비)."""
+        shares = (row[candidate_cols] / row["총 득표수"] * 100).round(1)
+        out = shares.reset_index()
+        out.columns = [COL_CANDIDATE, "득표율(%)"]
+        out["정당"] = out[COL_CANDIDATE].map(get_party)
+        out["지역"] = region_name
+        return out
+
+    compare_df = pd.concat(
+        [_candidate_shares(row_a, region_a), _candidate_shares(row_b, region_b)], ignore_index=True
+    )
+
+    compare_fig = px.bar(
+        compare_df,
+        x=COL_CANDIDATE,
+        y="득표율(%)",
+        color="정당",
+        color_discrete_map=PARTY_COLOR,
+        facet_col="지역",
+        text="득표율(%)",
+    )
+    compare_fig.update_traces(texttemplate="%{text}%", textposition="outside")
+    compare_fig.update_layout(showlegend=True)
+    compare_fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))  # "지역=서울..." -> "서울..."
+    st.plotly_chart(compare_fig, use_container_width=True)
+
+    metric_a, metric_b = st.columns(2)
+    metric_a.metric(
+        f"{region_a} 투표율", f"{row_a['투표율(%)']:.1f}%" if pd.notna(row_a["투표율(%)"]) else "정보 없음"
+    )
+    metric_b.metric(
+        f"{region_b} 투표율", f"{row_b['투표율(%)']:.1f}%" if pd.notna(row_b["투표율(%)"]) else "정보 없음"
+    )
+
+    st.divider()
     st.subheader(f"{level}별 비교 표")
     sort_col = st.selectbox("정렬 기준", ["1위 득표율(%)", "총 득표수", "격차(%p)"])
     ascending = sort_col == "격차(%p)"  # 격차는 작은 값(경합)부터 보는 게 자연스러움
