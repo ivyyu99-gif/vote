@@ -15,8 +15,8 @@
 #     3) 주요 정당의 후보를 정당 고유 색으로 표시해서, 지도(시도 단위)와
 #        막대그래프로 지역별 분포를 한눈에 보여줍니다.
 #     4) 1위와 2위 후보의 득표율 격차가 작은 "경합 지역"을 따로 찾아볼 수 있습니다.
+#     5) 투표율은 이 CSV에 "선거인수"/"투표수"로 들어있는 값을 지역 단위로 합산해서 직접 계산합니다.
 #
-# ※ 이 데이터에는 선거인수·투표수·무효표 컬럼이 없어서 투표율은 계산할 수 없습니다.
 # ============================================================
 
 import numpy as np
@@ -75,84 +75,6 @@ def get_party_color(party_name: str) -> str:
     return PARTY_COLOR.get(party_name, "#9AA0A6")
 
 
-# ------------------------------------------------------------
-# 0-2. 투표율 데이터
-# ------------------------------------------------------------
-# 제21대 대통령선거(2025-06-03) 시도별 최종 투표율.
-# 이 오픈API/CSV에는 투표율 정보가 없어서, 공개된 공식 개표 결과(중앙선거관리위원회 발표 기준)를
-# 직접 찾아 하드코딩해뒀습니다. 시도 단위를 선택했을 때만 사용됩니다.
-TURNOUT_BY_SIDO = {
-    "서울특별시": 80.1, "인천광역시": 77.7, "경기도": 79.4,
-    "부산광역시": 78.4, "울산광역시": 80.1, "경상남도": 78.5,
-    "대구광역시": 80.2, "경상북도": 78.9,
-    "광주광역시": 83.9, "전북특별자치도": 82.5, "전라남도": 83.6,
-    "대전광역시": 78.7, "세종특별자치시": 82.9, "충청북도": 77.3, "충청남도": 76.0,
-    "강원특별자치도": 77.6, "제주특별자치도": 74.6,
-}
-
-# 시군구 단위 투표율은 이 오픈API/CSV에 없고, 별도의 선관위 "투·개표 정보" 오픈API로만 조회할 수 있습니다.
-# (이 API는 여기까지 쓴 개표결과 API와는 완전히 다른 서비스라, 별도로 활용신청해서 받은
-#  서비스키가 필요합니다. secrets.toml에 NEC_TURNOUT_SERVICE_KEY로 등록하면 자동으로 켜집니다.)
-NEC_TURNOUT_URL = "http://apis.data.go.kr/9760000/VoteXmntckInfoInqireService2/getVoteSttusInfoInqire"
-NEC_TURNOUT_KEY = st.secrets.get("NEC_TURNOUT_SERVICE_KEY", "")
-# 선거ID(sgId)는 보통 선거일(YYYYMMDD), 선거종류코드(sgTypecode)는 대통령선거가 1번입니다.
-# 혹시 안 맞으면 secrets.toml에 NEC_SG_ID / NEC_SG_TYPECODE로 직접 지정할 수 있게 해뒀습니다.
-NEC_SG_ID = st.secrets.get("NEC_SG_ID", "20250603")
-NEC_SG_TYPECODE = st.secrets.get("NEC_SG_TYPECODE", "1")
-
-
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def fetch_turnout_from_nec(sido: str, sigungu: str):
-    """
-    선관위 '투·개표 정보' 오픈API에서 특정 시군구의 투표율을 조회한다.
-    (전국 250여 개 시군구를 매번 다 부르면 느리므로, 경합 지역으로 추려진 곳만 조회한다)
-
-    반환값: (성공 시 투표율(float), 실패 시 None), (실패 안내 메시지, 성공하면 None)
-    """
-    if not NEC_TURNOUT_KEY:
-        return None, None  # 키가 없으면 조용히 건너뜀 (경합 지역 탭에서 안내 문구로 대신 표시)
-
-    try:
-        resp = requests.get(
-            NEC_TURNOUT_URL,
-            params={
-                "ServiceKey": NEC_TURNOUT_KEY,
-                "sgId": NEC_SG_ID,
-                "sgTypecode": NEC_SG_TYPECODE,
-                "sdName": sido,
-                "wiwName": sigungu,
-                "numOfRows": 10,
-                "type": "json",
-            },
-            timeout=10,
-        )
-    except requests.exceptions.RequestException:
-        return None, "투표율 서버에 연결하지 못했어요."
-
-    if resp.status_code != 200:
-        return None, f"투표율 서버 오류 (HTTP {resp.status_code})"
-
-    # 이 API는 기본적으로 XML을 주기도 해서, JSON 파싱이 안 되면 XML로도 시도해본다.
-    try:
-        body = resp.json()
-        items = body.get("response", {}).get("body", {}).get("items", {}).get("item", [])
-        if isinstance(items, dict):
-            items = [items]
-        if not items:
-            return None, "해당 지역의 투표율 데이터를 찾지 못했어요."
-        return float(items[0].get("Turnout")), None
-    except (ValueError, AttributeError, TypeError):
-        try:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(resp.content)
-            turnout_el = root.find(".//Turnout")
-            if turnout_el is not None and turnout_el.text:
-                return float(turnout_el.text), None
-        except Exception:
-            pass
-        return None, "투표율 응답을 이해하지 못했어요 (형식 오류)."
-
-
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def fetch_sido_geojson():
     """
@@ -168,15 +90,10 @@ def fetch_sido_geojson():
 
 
 # 세로형(long) CSV의 '후보자' 컬럼에는 실제 후보자 이름 외에
-# "선거인수", "투표수", "무효 투표수", "기권자수" 같은 통계 행도 함께 섞여 있을 수 있다.
-# 이 값들은 후보자가 아니므로 득표 집계에서 반드시 제외해야 한다.
+# "선거인수", "투표수", "무효 투표수", "기권자수" 같은 통계 행도 함께 섞여 있다.
+# 이 값들은 후보자별 득표 집계에서는 제외해야 하지만, 투표율 계산에는 그대로 필요하므로
+# parse_election_csv 단계에서는 지우지 않고 남겨둔다 (아래 STAT_ROWS 참고).
 NON_CANDIDATE_VALUES = {"선거인수", "투표수", "무효 투표수", "기권자수", "계"}
-
-# 원본 CSV에 있을 수 있는 "후보자 득표수가 아닌" 컬럼들 (가로형일 때, 이 목록에 없는 컬럼은 후보자 이름으로 취급)
-NON_CANDIDATE_COLUMNS = {
-    COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG, "투표구명",
-    "선거인수", "투표수", "무효투표수", "무효 투표수", "기권수", "기권자수", "계",
-}
 
 
 def parse_election_csv(raw_bytes: bytes) -> tuple:
@@ -186,7 +103,8 @@ def parse_election_csv(raw_bytes: bytes) -> tuple:
 
     data.go.kr에서 받는 원본 CSV는 후보자 이름이 각각의 열로 나뉜
     "가로형(wide)" 표일 수도 있어서, 이 함수가 자동으로 세로형으로 바꿔준다.
-    (이미 세로형이면 통계 행만 제거하고 그대로 사용)
+    (이미 세로형이면 그대로 사용 - "선거인수"/"투표수" 같은 통계 행도 그대로 둔다.
+     투표율 계산에 쓰이므로 여기서 지우면 안 된다. 후보자별 집계를 할 때만 걸러낸다.)
 
     반환값: (성공 시 DataFrame, 실패 시 None), (실패했을 때 보여줄 안내 메시지, 성공하면 None)
     """
@@ -208,19 +126,21 @@ def parse_election_csv(raw_bytes: bytes) -> tuple:
             "중앙선거관리위원회 개표결과 원본 CSV가 맞는지 확인해주세요."
         )
 
-    # 이미 후보자/득표수 컬럼이 있는 세로형이면, 후보자가 아닌 통계 행(선거인수/투표수/무효표/기권수)을 제거하고 사용
+    # 이미 후보자/득표수 컬럼이 있는 세로형이면 그대로 사용 (통계 행 포함)
     if COL_CANDIDATE in df.columns and COL_VOTES in df.columns:
-        df = df[~df[COL_CANDIDATE].isin(NON_CANDIDATE_VALUES)].copy()
         return df, None
 
-    # 가로형(후보자 이름이 열)이면 -> 세로형으로 녹여서(melt) 통일
-    candidate_columns = [c for c in df.columns if c not in NON_CANDIDATE_COLUMNS]
-    if not candidate_columns:
+    # 가로형(후보자 이름 + 선거인수/투표수 등이 각각 열)이면 -> 세로형으로 녹여서(melt) 통일.
+    # 시도명/구시군명/읍면동명/투표구명만 "지역 식별용" 컬럼이고, 나머지는 전부
+    # (후보자 득표수든 선거인수/투표수든) 후보자 컬럼의 값으로 녹여낸다 - 투표율 계산에 필요하기 때문.
+    id_like_columns = {COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG, "투표구명"}
+    value_columns = [c for c in df.columns if c not in id_like_columns]
+    if not value_columns:
         return None, "📄 CSV에서 후보자 득표수 컬럼을 찾지 못했어요. 컬럼 이름을 확인해주세요."
 
     id_columns = [c for c in [COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG] if c in df.columns]
     long_df = df.melt(
-        id_vars=id_columns, value_vars=candidate_columns,
+        id_vars=id_columns, value_vars=value_columns,
         var_name=COL_CANDIDATE, value_name=COL_VOTES,
     )
     return long_df, None
@@ -264,26 +184,38 @@ def load_mock_data() -> pd.DataFrame:
         ("서울특별시", "강남구", "역삼동", "국민의힘 김문수", 12000),
         ("서울특별시", "강남구", "역삼동", "개혁신당 이준석", 1800),
         ("서울특별시", "강남구", "역삼동", "민주노동당 권영국", 300),
+        ("서울특별시", "강남구", "역삼동", "선거인수", 30000),
+        ("서울특별시", "강남구", "역삼동", "투표수", 23100),
         ("서울특별시", "노원구", "상계동", "더불어민주당 이재명", 11000),
         ("서울특별시", "노원구", "상계동", "국민의힘 김문수", 8000),
         ("서울특별시", "노원구", "상계동", "개혁신당 이준석", 1200),
         ("서울특별시", "노원구", "상계동", "민주노동당 권영국", 400),
+        ("서울특별시", "노원구", "상계동", "선거인수", 26000),
+        ("서울특별시", "노원구", "상계동", "투표수", 20600),
         ("경기도", "성남시", "분당동", "더불어민주당 이재명", 15000),
         ("경기도", "성남시", "분당동", "국민의힘 김문수", 14800),
         ("경기도", "성남시", "분당동", "개혁신당 이준석", 2000),
         ("경기도", "성남시", "분당동", "민주노동당 권영국", 350),
+        ("경기도", "성남시", "분당동", "선거인수", 40000),
+        ("경기도", "성남시", "분당동", "투표수", 32150),
         ("부산광역시", "해운대구", "우동", "더불어민주당 이재명", 9500),
         ("부산광역시", "해운대구", "우동", "국민의힘 김문수", 12500),
         ("부산광역시", "해운대구", "우동", "개혁신당 이준석", 1800),
         ("부산광역시", "해운대구", "우동", "민주노동당 권영국", 300),
+        ("부산광역시", "해운대구", "우동", "선거인수", 30000),
+        ("부산광역시", "해운대구", "우동", "투표수", 24100),
         ("전라남도", "순천시", "연향동", "더불어민주당 이재명", 13000),
         ("전라남도", "순천시", "연향동", "국민의힘 김문수", 6000),
         ("전라남도", "순천시", "연향동", "개혁신당 이준석", 900),
         ("전라남도", "순천시", "연향동", "민주노동당 권영국", 250),
+        ("전라남도", "순천시", "연향동", "선거인수", 25000),
+        ("전라남도", "순천시", "연향동", "투표수", 20150),
         ("대구광역시", "수성구", "범어동", "더불어민주당 이재명", 7000),
         ("대구광역시", "수성구", "범어동", "국민의힘 김문수", 14000),
         ("대구광역시", "수성구", "범어동", "개혁신당 이준석", 1500),
         ("대구광역시", "수성구", "범어동", "민주노동당 권영국", 200),
+        ("대구광역시", "수성구", "범어동", "선거인수", 28000),
+        ("대구광역시", "수성구", "범어동", "투표수", 22700),
     ]
     return pd.DataFrame(
         sample, columns=[COL_SIDO, COL_SIGUNGU, COL_EUPMYEONDONG, COL_CANDIDATE, COL_VOTES]
@@ -311,10 +243,21 @@ def aggregate_votes(df: pd.DataFrame, level: str) -> pd.DataFrame:
     """
     지역 단위별로 후보자 득표수를 합산해서 아래 컬럼을 가진 표를 만든다.
     region, (후보자별 득표수 여러 열), 총 득표수, 1위 후보, 1위 정당, 1위 득표율(%),
-    2위 후보, 2위 득표율(%), 격차(%p)  ※ 격차 = 1위 득표율 - 2위 득표율 (작을수록 경합 지역)
+    2위 후보, 2위 득표율(%), 격차(%p), 투표율(%)
+    ※ 격차 = 1위 득표율 - 2위 득표율 (작을수록 경합 지역)
+    ※ 투표율 = 원본 CSV에 "선거인수"/"투표수"로 들어있는 행을 지역 단위로 합산해서 직접 계산
     """
     df = add_region_column(df, level)
     df[COL_VOTES] = pd.to_numeric(df[COL_VOTES], errors="coerce").fillna(0)
+
+    # 후보자 득표수가 아닌 통계 행(선거인수/투표수/무효표/기권수)은 따로 떼어서 투표율 계산에 쓴다
+    stats_df = df[df[COL_CANDIDATE].isin(NON_CANDIDATE_VALUES)]
+    sunsu_by_region = stats_df[stats_df[COL_CANDIDATE] == "선거인수"].groupby("region")[COL_VOTES].sum()
+    tusu_by_region = stats_df[stats_df[COL_CANDIDATE] == "투표수"].groupby("region")[COL_VOTES].sum()
+    turnout_by_region = (tusu_by_region / sunsu_by_region * 100).round(2)
+
+    # 여기서부터는 순수 후보자 득표수만 남긴다
+    df = df[~df[COL_CANDIDATE].isin(NON_CANDIDATE_VALUES)]
 
     # 지역 x 후보자 별 득표 합산
     long_table = df.groupby(["region", COL_CANDIDATE])[COL_VOTES].sum().reset_index()
@@ -350,13 +293,14 @@ def aggregate_votes(df: pd.DataFrame, level: str) -> pd.DataFrame:
         wide_table["2위 득표율(%)"] = 0.0
 
     wide_table["격차(%p)"] = (wide_table["1위 득표율(%)"] - wide_table["2위 득표율(%)"]).round(2)
+    wide_table["투표율(%)"] = wide_table.index.map(turnout_by_region)
 
     return wide_table.reset_index()
 
 
 def national_candidate_totals(df: pd.DataFrame) -> pd.DataFrame:
     """전국 후보자별 총 득표수와 정당, 정당 색상."""
-    df = df.copy()
+    df = df[~df[COL_CANDIDATE].isin(NON_CANDIDATE_VALUES)].copy()
     df[COL_VOTES] = pd.to_numeric(df[COL_VOTES], errors="coerce").fillna(0)
     totals = df.groupby(COL_CANDIDATE)[COL_VOTES].sum().sort_values(ascending=False).reset_index()
     totals = totals.rename(columns={COL_VOTES: "총 득표수"})
@@ -561,45 +505,25 @@ with tab5:
 
         # --- 투표율 ---
         st.subheader("경합 지역 투표율")
-        if level == "시도":
-            close_races = close_races.copy()
-            close_races["투표율(%)"] = close_races["region"].map(TURNOUT_BY_SIDO)
-            st.caption("시도별 최종 투표율(선관위 발표 기준, 직접 확인해 반영한 수치)입니다.")
+        st.caption("이 CSV에 '선거인수'/'투표수'로 들어있는 값을 지역 단위로 합산해 직접 계산했습니다.")
+        turnout_data = close_races.dropna(subset=["투표율(%)"])
+        if turnout_data.empty:
+            st.info("이 지역들의 투표율 데이터를 찾지 못했어요.")
+        else:
             turnout_fig = px.bar(
-                close_races.dropna(subset=["투표율(%)"]),
+                turnout_data,
                 x="region", y="투표율(%)", color="1위 정당", color_discrete_map=PARTY_COLOR,
+                hover_data=["1위 후보", "1위 득표율(%)"],
+            )
+            turnout_fig.update_layout(
+                xaxis_title="", xaxis={"categoryorder": "array", "categoryarray": close_races["region"].tolist()}
             )
             st.plotly_chart(turnout_fig, use_container_width=True)
-        elif NEC_TURNOUT_KEY:
-            st.caption("선관위 '투·개표 정보' 오픈API로 시군구별 투표율을 실시간 조회합니다.")
-            turnout_rows = []
-            for _, r in close_races.iterrows():
-                parts = r["region"].split(" ", 1)
-                sido_name = parts[0]
-                sigungu_name = parts[1] if len(parts) > 1 else ""
-                turnout, err = fetch_turnout_from_nec(sido_name, sigungu_name)
-                turnout_rows.append(turnout)
-            close_races = close_races.copy()
-            close_races["투표율(%)"] = turnout_rows
-            if close_races["투표율(%)"].notna().any():
-                turnout_fig = px.bar(
-                    close_races.dropna(subset=["투표율(%)"]),
-                    x="region", y="투표율(%)", color="1위 정당", color_discrete_map=PARTY_COLOR,
-                )
-                st.plotly_chart(turnout_fig, use_container_width=True)
-            else:
-                st.warning("투표율을 하나도 받아오지 못했어요. sgId/sgTypecode 값이 맞는지 확인해주세요.")
-        else:
-            st.info(
-                "시군구·읍면동 단위 투표율은 이 CSV에 없고, 별도의 선관위 '투·개표 정보' 오픈API가 필요해요. "
-                "data.go.kr에서 '중앙선거관리위원회_투·개표 정보'를 활용신청한 뒤, "
-                "서비스키를 secrets.toml에 NEC_TURNOUT_SERVICE_KEY로 등록하면 여기에 자동으로 표시됩니다."
-            )
 
         st.dataframe(
             close_races[
-                ["region", "1위 후보", "1위 득표율(%)", "2위 후보", "2위 득표율(%)", "격차(%p)", "총 득표수"]
-                + (["투표율(%)"] if "투표율(%)" in close_races.columns else [])
+                ["region", "1위 후보", "1위 득표율(%)", "2위 후보", "2위 득표율(%)",
+                 "격차(%p)", "투표율(%)", "총 득표수"]
             ],
             use_container_width=True,
         )
@@ -614,9 +538,7 @@ with tab5:
 
 st.divider()
 st.caption(
-    "⚠️ 이 데이터에는 선거인수·투표수·무효표 컬럼이 없어 투표율은 계산할 수 없습니다. "
-    "시도 단위 투표율은 선관위 발표 수치를 직접 반영했고, 시군구 단위 투표율은 "
-    "별도 오픈API 서비스키(NEC_TURNOUT_SERVICE_KEY)가 있을 때만 표시됩니다. "
+    "⚠️ 투표율은 이 CSV에 '선거인수'/'투표수'로 들어있는 값을 지역 단위로 합산해서 직접 계산한 값입니다. "
     "지도는 공개 행정구역 경계 데이터를 사용하며, 여기 없는 후보 이름은 '기타/무소속'(회색)으로 표시됩니다. "
     "GitHub 주소가 비어있거나 오류가 나면 데모(가상) 데이터로 자동 대체됩니다."
 )
